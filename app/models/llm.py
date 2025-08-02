@@ -30,7 +30,6 @@ class LLM:
     ):
         """
         Initialize the LLM class with QLoRA support and vector store integration.
-
         Args:
             base_model: HuggingFace model identifier
             peft_dir: Directory to save/load LoRA adapter weights
@@ -61,62 +60,105 @@ class LLM:
         self.client = PersistentClient(path=self.vectorstore_dir)
         self.collection = self.client.get_or_create_collection(name="style_memory")
 
-    def _load_model_and_tokenizer(self):
-        """Load model and tokenizer with QLoRA configuration."""
-        print(f"Loading model on device: {self.device}")
+    def _check_model_files_exist(self, path: str) -> bool:
+        """Check if required model files exist in the given path."""
+        required_files = ["config.json"]  # Minimum required file
+        optional_files = [
+            "pytorch_model.bin",
+            "model.safetensors",
+            "pytorch_model-00001-of-00001.bin",
+        ]
+
+        # Check if config.json exists (required)
+        if not os.path.exists(os.path.join(path, "config.json")):
+            return False
+
+        # Check if at least one model weight file exists
+        model_file_exists = any(
+            os.path.exists(os.path.join(path, f)) for f in optional_files
+        )
+
+        # Also check for sharded models (multiple files)
+        if not model_file_exists:
+            # Look for any pytorch_model files or safetensors files
+            for file in os.listdir(path):
+                if file.startswith("pytorch_model") or file.endswith(".safetensors"):
+                    model_file_exists = True
+                    break
+
+        return model_file_exists
+
+    def _find_cached_model(self, local_cache_dir: str) -> Optional[str]:
+        """Find the model in local cache directory if it exists."""
+        if not os.path.exists(local_cache_dir):
+            return None
+
+        # Try different potential paths
+        potential_paths = [
+            os.path.join(
+                local_cache_dir, self.base_model.split("/")[-1]
+            ),  # Just model name
+            os.path.join(
+                local_cache_dir, self.base_model.replace("/", "--")
+            ),  # HF cache format
+            os.path.join(local_cache_dir, self.base_model),  # Full path
+        ]
+
+        for path in potential_paths:
+            if os.path.exists(path) and os.path.isdir(path):
+                if self._check_model_files_exist(path):
+                    print(f"Found cached model at: {path}")
+                    return path
+                else:
+                    print(f"Found directory {path} but missing required model files")
+
+        return None
 
     def _load_model_and_tokenizer(self):
-        """Load model and tokenizer with QLoRA configuration from local cache."""
+        """Load model and tokenizer with QLoRA configuration from local cache or download."""
         print(f"Loading model on device: {self.device}")
-        from huggingface_hub import login
 
-        login(token=os.environ.get("HF_TOKEN"))
+        # Login to HuggingFace if token is available
+        if os.environ.get("HF_TOKEN"):
+            from huggingface_hub import login
+
+            login(token=os.environ.get("HF_TOKEN"))
 
         # Define local cache directory
         local_cache_dir = "/app/models/model_storage/hf_cache/"
 
-        # Check if local cache exists, otherwise fall back to HuggingFace
-        model_path = self.base_model
-        if os.path.exists(local_cache_dir):
-            # Look for the model in the cache directory
-            potential_paths = [
-                os.path.join(
-                    local_cache_dir, self.base_model.split("/")[-1]
-                ),  # Just model name
-                os.path.join(
-                    local_cache_dir, self.base_model.replace("/", "--")
-                ),  # HF cache format
-                os.path.join(local_cache_dir, self.base_model),  # Full path
-            ]
+        # Check if model exists in local cache
+        cached_model_path = self._find_cached_model(local_cache_dir)
 
-            for path in potential_paths:
-                if os.path.exists(path) and os.path.isdir(path):
-                    # Check if it contains model files
-                    model_files = [
-                        "config.json",
-                        "pytorch_model.bin",
-                        "model.safetensors",
-                    ]
-                    if any(os.path.exists(os.path.join(path, f)) for f in model_files):
-                        model_path = path
-                        print(f"Found cached model at: {model_path}")
-                        break
-            else:
-                print(
-                    f"No cached model found in {local_cache_dir}, using HuggingFace: {self.base_model}"
-                )
+        if cached_model_path:
+            model_path = cached_model_path
+            use_local_files = True
+            cache_dir = None  # Don't need cache_dir when using local files
+            print(f"Using cached model from: {model_path}")
         else:
+            model_path = self.base_model
+            use_local_files = False
+            cache_dir = (
+                local_cache_dir
+                if os.path.exists(os.path.dirname(local_cache_dir))
+                else None
+            )
             print(
-                f"Cache directory {local_cache_dir} not found, using HuggingFace: {self.base_model}"
+                f"Model not found in cache, downloading from HuggingFace: {self.base_model}"
             )
 
+            # Create cache directory if it doesn't exist
+            if cache_dir and not os.path.exists(cache_dir):
+                os.makedirs(cache_dir, exist_ok=True)
+                print(f"Created cache directory: {cache_dir}")
+
         # Initialize tokenizer
+        print("Loading tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
             use_fast=True,
-            cache_dir=local_cache_dir if os.path.exists(local_cache_dir) else None,
-            local_files_only=model_path
-            != self.base_model,  # Only use local files if we found a local path
+            cache_dir=cache_dir,
+            local_files_only=use_local_files,
         )
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -129,15 +171,20 @@ class LLM:
         )
 
         # Load base model with quantization
+        print("Loading model...")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             quantization_config=bnb_config,
             device_map="auto",
-            cache_dir=local_cache_dir if os.path.exists(local_cache_dir) else None,
-            local_files_only=model_path
-            != self.base_model,  # Only use local files if we found a local path
+            cache_dir=cache_dir,
+            local_files_only=use_local_files,
         )
 
+        # Setup LoRA adapter
+        self._setup_lora_adapter()
+
+    def _setup_lora_adapter(self):
+        """Setup LoRA adapter - either load existing or prepare for training."""
         # Load existing adapter or prepare for training
         if self.load_existing_adapter and os.path.exists(self.peft_dir):
             print(f"Loading existing LoRA adapter from {self.peft_dir}")
@@ -155,54 +202,28 @@ class LLM:
                 bias="none",
                 task_type="CAUSAL_LM",
             )
-
             self.model = get_peft_model(self.model, lora_config)
 
         self.model.to(self.device)
-        if hasattr(self.model, "print_trainable_parameters"):
-            self.model.print_trainable_parameters()
 
-        # Load existing adapter or prepare for training
-        if self.load_existing_adapter and os.path.exists(self.peft_dir):
-            print(f"Loading existing LoRA adapter from {self.peft_dir}")
-            self.model = PeftModel.from_pretrained(self.model, self.peft_dir)
-        else:
-            print("Preparing model for training")
-            self.model = prepare_model_for_kbit_training(self.model)
-
-            # LoRA configuration
-            lora_config = LoraConfig(
-                r=8,
-                lora_alpha=32,
-                target_modules=["q_proj", "v_proj"],
-                lora_dropout=0.05,
-                bias="none",
-                task_type="CAUSAL_LM",
-            )
-
-            self.model = get_peft_model(self.model, lora_config)
-
-        self.model.to(self.device)
         if hasattr(self.model, "print_trainable_parameters"):
             self.model.print_trainable_parameters()
 
     def load_data_to_vector_store(self, data_dir: str, pattern: str = "*.json"):
         """
         Load training data into the vector store.
-
         Args:
             data_dir: Directory containing JSON data files
             pattern: File pattern to match (default: "*.json")
         """
         data_files = glob(os.path.join(data_dir, pattern))
-
         if not data_files:
             print(f"No files found matching pattern {pattern} in {data_dir}")
             return
 
         for data_file in data_files:
             print(f"Loading data from: {data_file}")
-            with open(data_file, "rb") as f:
+            with open(data_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
             if "text" in data:
@@ -222,12 +243,10 @@ class LLM:
     ):
         """
         Prepare dataset for training from JSON files.
-
         Args:
             data_dir: Directory containing training data
             pattern: File pattern to match
             max_length: Maximum sequence length for tokenization
-
         Returns:
             Tuple of (train_dataset, eval_dataset)
         """
@@ -235,7 +254,7 @@ class LLM:
         all_texts = []
 
         for data_file in data_files:
-            with open(data_file, "rb") as f:
+            with open(data_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
             if "text" in data:
@@ -270,7 +289,6 @@ class LLM:
 
         tokenized_dataset = tokenized_dataset.map(group_texts, batched=True)
         split = tokenized_dataset.train_test_split(test_size=0.1)
-
         return split["train"], split["test"]
 
     def train(
@@ -288,7 +306,6 @@ class LLM:
     ):
         """
         Train the model with QLoRA.
-
         Args:
             train_dataset: Training dataset
             eval_dataset: Evaluation dataset
@@ -335,7 +352,6 @@ class LLM:
     ) -> str:
         """
         Generate response using retrieved context from vector store.
-
         Args:
             user_input: User's question/prompt
             top_k: Number of similar documents to retrieve
@@ -343,7 +359,6 @@ class LLM:
             context_length: Maximum context length in characters
             do_sample: Whether to use sampling for generation
             temperature: Temperature for sampling (if enabled)
-
         Returns:
             Generated response string
         """
@@ -386,18 +401,15 @@ A:"""
 
         decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
         answer = decoded.split("A:")[-1].strip()
-
         return answer
 
     def generate(self, prompt: str, max_new_tokens: int = 50, **kwargs) -> str:
         """
         Generate response without context retrieval.
-
         Args:
             prompt: Input prompt
             max_new_tokens: Maximum tokens to generate
             **kwargs: Additional generation parameters
-
         Returns:
             Generated response string
         """
@@ -418,7 +430,6 @@ A:"""
         decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
         # Remove the original prompt from the output
         response = decoded[len(prompt) :].strip()
-
         return response
 
     def save_adapter(self, save_path: Optional[str] = None):
@@ -440,20 +451,20 @@ A:"""
 
 
 # Example usage
-if __name__ == "__main__":
-    # Initialize the LLM
-    llm = LLM(load_existing_adapter=False)
+# if __name__ == "__main__":
+# Initialize the LLM
+# llm = LLM(load_existing_adapter=False)
 
-    # Load data into vector store
-    data_dir = "../data/prompt_response/"
-    llm.load_data_to_vector_store(data_dir)
+# Load data into vector store
+# data_dir = "../data/prompt_response/"
+# llm.load_data_to_vector_store(data_dir)
 
-    # Example inference
-    user_question = "What is your favorite color?"
-    response = llm.generate_with_context(user_question)
-    print(f"Q: {user_question}")
-    print(f"A: {response}")
+# Example inference
+# user_question = "What is your favorite color?"
+# response = llm.generate_with_context(user_question)
+# print(f"Q: {user_question}")
+# print(f"A: {response}")
 
-    # Example training (uncomment to use)
-    # train_dataset, eval_dataset = llm.prepare_training_dataset(data_dir)
-    # llm.train(train_dataset, eval_dataset)
+# Example training (uncomment to use)
+# train_dataset, eval_dataset = llm.prepare_training_dataset(data_dir)
+# llm.train(train_dataset, eval_dataset)

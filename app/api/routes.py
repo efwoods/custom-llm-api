@@ -32,25 +32,25 @@ class GenerateResponse(BaseModel):
 
 
 # Mock function for testing - remove when using real model
-def get_llm_model():
-    class MockLLM:
-        def __init__(self):
-            self.base_model = "meta-llama/Llama-3.2-3B-Instruct"
-            self.peft_dir = "./qlora_adapter"
-            self.vectorstore_dir = "./chroma_db"
-            self.device = "cpu"
-            self.load_existing_adapter = True
+# def get_llm_model():
+#     class MockLLM:
+#         def __init__(self):
+#             self.base_model = "meta-llama/Llama-3.2-3B-Instruct"
+#             self.peft_dir = "./qlora_adapter"
+#             self.vectorstore_dir = "./chroma_db"
+#             self.device = "cpu"
+#             self.load_existing_adapter = True
 
-        def generate_with_context(self, user_input, **kwargs):
-            return f"Mock response with context for: {user_input}"
+#         def generate_with_context(self, user_input, **kwargs):
+#             return f"Mock response with context for: {user_input}"
 
-        def generate(self, prompt, **kwargs):
-            return f"Mock response for: {prompt}"
+#         def generate(self, prompt, **kwargs):
+#             return f"Mock response for: {prompt}"
 
-        def get_vector_store_stats(self):
-            return {"total_documents": 100}
+#         def get_vector_store_stats(self):
+#             return {"total_documents": 100}
 
-    return MockLLM()
+#     return MockLLM()
 
 
 @router.websocket("/generate")
@@ -336,7 +336,7 @@ async def general_websocket(websocket: WebSocket):
             try:
                 # Receive message from client
                 data = await websocket.receive_text()
-                logger.info("General WebSocket message received")
+                logger.info(f"General WebSocket message received: {data}")
 
                 # Parse JSON message
                 message = json.loads(data)
@@ -426,7 +426,7 @@ async def general_websocket(websocket: WebSocket):
 
 
 # Keep one GET endpoint for documentation
-@router.get("/ws-info", tags=["WebSocket"])
+@router.get("/ws-info")
 async def websocket_info():
     """
     Information about available WebSocket endpoints.
